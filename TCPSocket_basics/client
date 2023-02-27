@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+import json
+import socket
+import argparse
+import ssl
+
+
+'''
+    References
+    https://stackoverflow.com/questions/39817641/how-to-send-a-json-object-using-tcp-socket-in-python
+    https://pynative.com/python-json-load-and-loads-to-parse-json/
+    https://stackoverflow.com/questions/36706734/reading-words-from-a-file-and-putting-into-list
+    https://docs.python.org/3/library/ssl.html
+'''
+
+#COMMAND LINE ARGUMENTS
+parser = argparse.ArgumentParser(usage = "./client <-p port> <-s> <hostname> <Northeastern-username>")
+parser.add_argument('-p', '--PORT', type=int, default=27993) #optional
+parser.add_argument('-s', '--TLS', action = "store_true") #optional
+parser.add_argument('hostname', type=str) #required
+parser.add_argument('northeastern_username', type=str) #required
+args = parser.parse_args()
+
+HOST = args.hostname
+if args.TLS:
+    PORT = 27994
+else: 
+    PORT = args.PORT
+#SET UP SOCKET
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+if args.TLS:
+    s = ssl.wrap_socket(s)
+s.connect((HOST, PORT))
+
+#HELLO MESSAGE
+hellomessage = {"type": "hello", "northeastern_username": args.northeastern_username}
+jsonconvert = json.dumps(hellomessage) +  "\n" #converts to json string
+s.sendall(jsonconvert.encode("utf-8")) #send to server
+receive = s.recv(1024) #receive reply from server
+Instructor
+| 01/29 at 9:07 pm
+Grading comment:
+Same as the below read comment. In this case it is okay with the hello message as the response should always be the same. 
+
+receive = receive.decode("utf-8")
+received =json.loads(receive)
+
+#WORDLIST
+#guesses will be from this wordlist
+#contents are being read into a list
+wordlist = 'project1words.txt'
+list_of_words = []
+with open(wordlist, "r") as f:
+    list_of_words = f.read().split()
+
+
+#GUESSING STRATEGY
+#creating a new list and iterating over each word in the original list. 
+# For each word, we check if it should be included in the new list based on the marks and word given. 
+# If it should be included, we add it to the new list. 
+def modifyList(list_of_words, word, marks):
+    chars = list(word) #list the characters of a word
+    new_list = [] #new list to which we will be adding words to 
+    for w in list_of_words:
+        include = True #include is all the words that will be added to our new_list
+        for i in range(5): #through each output of marks
+            if marks[i] == 0 and word[i] in w and (chars.count(word[i])<2):
+                include = False
+                chars.append(word[i])
+                break
+            elif marks[i] == 1 and w[i] == word[i]:
+                include = False
+                chars.append(word[i])
+                break
+            elif marks[i] == 2 and w[i] != word[i]:
+                include = False
+                chars.append(word[i])
+                break
+        if include:
+            new_list.append(w)
+    return new_list
+
+
+#SEND GUESSES
+# repeatedly send guesses until the server sends a "bye" message.
+#iterate over list
+word_iterator = iter(list_of_words)
+# create an empty set to store already guessed words
+already_guessed = set()
+while True: #while there are still words left inside the list
+    if not list_of_words: #end while loop when the list has been fully iterated through
+        break
+    word = next(word_iterator, None)
+    if word is None:
+        break
+    # check if the word has already been guessed
+    if word in already_guessed:
+        continue
+    already_guessed.add(word)
+    if 'id' in received:
+        id = received['id']
+        guess = {"type": "guess", "id": id, "word": word}
+        guessmessage = json.dumps(guess) + "\n"
+        s.sendall(guessmessage.encode("utf-8"))
+        receive = s.recv(1024) #receive reply from server
+Instructor
+| 01/29 at 9:06 pm
+Grading comment:
+This should be read in a loop until you receive a \n character. If not there will be an error if the message is too long. 
+
+        receive = receive.decode("utf-8")
+        received =json.loads(receive)
+    if received["type"] == "retry":
+        if "guesses" in received:
+            guesses = received['guesses']
+            marks = guesses[-1]['marks']
+            word = guesses[-1]['word'] 
+            list_of_words = modifyList(list_of_words, word, marks)
+            word_iterator = iter(list_of_words) #update iterator
+    elif received["type"] == "bye":
+        flag = received['flag']
+        print(flag)
+        break
+s.close()
