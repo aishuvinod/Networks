@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+import socket
+import argparse
+import urllib.parse
+
+
+#COMMAND LINE ARGUMENTS
+parser = argparse.ArgumentParser(usage = "./client <operation> <param1> <param2>")
+parser.add_argument('operation', type=str, choices=["ls", "mkdir", "rm", "rmdir", "cp", "mv", "add"]) 
+parser.add_argument('param', nargs="+", type=str) #required
+args = parser.parse_args()
+
+PORT = 21
+HOST = "ftp.3700.network"
+#set up tcp socket
+control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+control.connect((HOST, PORT))
+data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+#quit 
+def quit():
+    control.sendall(("QUIT" + "\r\n").encode("utf-8"))
+    receive = control.recv(1024)
+Instructor
+| 02/08 at 5:56 pm
+Grading comment:
+You should always be reading from the socket in a loop. I would recommend creating a separate function that contains this functionality and calls it with the socket whenever you need to read data.
+
+    receive = receive.decode("utf-8")
+    print(receive)
+
+#make remote directory
+def mkdir(dir_name):
+    control.sendall(("MKD " + dir_name + "\r\n").encode("utf-8"))
+    receive = control.recv(1024)
+    receive = receive.decode("utf-8")
+    print(receive)
+    quit()
+
+
+#delete remote directory
+def rmdir(dir_name):
+    control.sendall(("RMD " + dir_name + "\r\n").encode("utf-8"))
+    receive = control.recv(1024)
+    receive = receive.decode("utf-8")
+    print(receive)
+    quit()
+
+
+#create a new data channel
+def open_data_channel():
+    control.sendall(("PASV " + "\r\n").encode())
+    response = control.recv(1024).decode()
+    print(response)
+
+    # extract the host and port information from the PASV response
+    #start and end variables are the start and end indices of the IP address and port number
+    start = response.find("(")
+    end = response.find(")")
+    data = response[start+1:end].split(",") #ip information is separated by commas; dont include parantheses
+    host = ".".join(data[:4]) #an ip string consists of dots; first four elements
+    # The port number is calculated
+    if len(data) >= 6:
+        port = (int(data[4]) << 8) + int(data[5])
+    # create a new data socket and connect to the data channel
+        data_socket.connect((host, port))
+    else :
+       print("An error occurred while uploading the file") 
+  
+        
+
+
+
+#upload file
+# def upload(source, path):
+#     open_data_channel()
+#     path = path.split("/")[-1]
+#     source = source.path
+#     try:
+#         control.sendall((f"STOR {path}\r\n".encode()))
+#         receive = control.recv(1024).decode('utf-8')
+#         print(receive)
+#         file_contents = open(source, "rb")
+#         contents = file_contents.read()
+#         data_socket.sendall(contents)
+#     except Exception as e:
+#         print(f"An error occurred while uploading the file: {e}")
+#     finally:
+#         data_socket.close()
+
+def upload(source, path):
+    open_data_channel()
+    path = urllib.parse.quote(path.split("/")[-1])
+    source = source.path
+    try:
+        control.sendall((f"STOR {path}\r\n".encode()))
+        receive = control.recv(1024).decode('utf-8')
+        print(receive)
+        with open(source, "rb") as file_contents:
+            contents = file_contents.read()
+            data_socket.sendall(contents)
+    except Exception as e:
+        print(f"An error occurred while uploading the file: {e}")
+    finally:
+        data_socket.close()
+
+
+#download file
+def download(source, path):
+    open_data_channel()
+    source = source.path
+    control.sendall((f"RETR {source}\r\n".encode()))
+    controlreceive = control.recv(1024).decode('utf-8') 
+    print(controlreceive)
+    if not data_socket.getpeername():
+        data_socket.connect()
+        
+    datasofar = b''
+    receive = b''
+    while True:
+        try:
+            receive = data_socket.recv(1024)
+        except OSError as e:
+            print("Error while receiving data: ", e)
+        if receive == b'':
+            break
+        datasofar += receive
+    local_file = open(path, "wb")
+    local_file.write(datasofar)
+    local_file.close()
+    data_socket.close()
+
+
+#choose whether upload or dpwnload    
+def choose(path):
+    if (url[0].scheme == "ftp"):
+        download(url[0], url[1].path)
+    else : #not ftp
+        upload(url[0], url[1].path)
+        
+
+
+#delete file
+def delete(path):
+    control.sendall(("DELE " + path + "\r\n").encode("utf-8"))
+    receive = control.recv(1024)
+    receive = receive.decode("utf-8")
+    print(receive)
+    quit()
+
+#FOR TESTING
+def addfile(path):
+    open_data_channel()
+    control.sendall(("STOR " + str(path) + "\r\n").encode("utf-8"))
+    receive = control.recv(1024)
+    receive = receive.decode("utf-8")
+    print(receive)
+    quit()
+    data_socket.close()
+
+
+def move(source, dest):
+    if url[0].scheme == "ftp":  
+        download(source, dest)
+        delete(source)
+    else:
+        upload(source, dest)
+        delete(source)
+
+
+
+#control channel is for commands and responses
+#data channel is used fot transmitting file contents
+#directs commands to functions
+def call():
+    if (args.operation == "mkdir"):
+        mkdir(url[0].path)
+    elif (args.operation == "rmdir"):
+        rmdir(url[0].path)
+    elif (args.operation == "ls"):
+        list_channel(url[0].path)
+    elif (args.operation == "rm"):
+        delete(url[0].path)
+    elif (args.operation == "cp"):
+        choose(url[0])
+    elif (args.operation == "mv"):
+        move(url[0], url[1].path)
+    #!!!!!!11!!!REMOVE THISSSSS!!!!! AND ALSO ABOVE
+    elif (args.operation == "add"):
+        addfile(url[0].path)
+    
+
+#login with username and password
+def login(user, password):
+    user = 'USER ' + user +'\r\n'
+    password = 'PASS ' + password +'\r\n'
+    input = [user, password, "TYPE I\r\n", "MODE S\r\n", "STRU F\r\n"]
+    
+    for i in input:
+        control.sendall(i.encode("utf-8"))
+        receive = control.recv(1024) 
+        receive = receive.decode("utf-8")
+        print(receive)
+    call()
+
+
+
+#list the contents of the channel in passive mode
+def list_channel(path):
+    open_data_channel() 
+    control.sendall(("LIST " + str(path) + "\r\n").encode("utf-8"))
+    control.recv(1024)
+    response = data_socket.recv(1024).decode("utf-8")
+    print(response)
+    data_socket.close()
+
+
+
+#parse url
+url = []
+if (args.param != None):
+    for urls in args.param:
+        url.append(urllib.parse.urlparse(urls))
+print(url)
+
+     
+#LOGIN 
+#while copying username and password will change based on whether you're uploading and downloading
+if (url[0].scheme == "ftp"):   
+    login(user = url[0].username, password = url[0].password) 
+else :
+    login(user = url[1].username, password = url[1].password) 
+data_socket.close()
