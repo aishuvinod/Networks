@@ -1,0 +1,360 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import socket
+import time
+import json
+import select
+import struct
+import sys
+import math
+import traceback
+
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+    routing_table = []
+    withdrawn_networks = []
+    updated_networks = []
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({"type": "handshake", "src": self.our_addr(
+                neighbor), "dst": neighbor, "msg": {}}))
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    
+    @staticmethod
+    #from stackoverflow;;;; converting to binary
+    def tobinary(address):
+        octets = map(int, address.split('/')[0].split('.'))
+        binary = '{0:08b}{1:08b}{2:08b}{3:08b}'.format(*octets)
+        range = int(address.split('/')[1]) if '/' in address else None
+        binary[:range] if range else binary
+        return binary[:range] if range else binary
+    
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode(
+            'utf-8'), ('localhost', self.ports[network]))
+
+    #checking to see if two entries in the routing table are numerically adjacent to see if they need to be aggregated
+    def is_adjacent(self, entry1, entry2, netmask):
+        split_e1 = int(entry1.split('.')[2])
+        split_e2 = int(entry2.split('.')[2])
+        split_nm = int(netmask.split('.')[2])
+        return split_e1 == abs(split_nm - 255) + 1 + split_e2
+
+
+    #Once you decide to aggregate, you need to change the netmask by one bit
+    def change_netmask(self, data):
+    # converts the IP address string into a binary string representation, and the result is stored in the binary variable.
+        binary = Router.tobinary(data)
+    # This line finds the last occurrence of the character '0' in the binary string using the rfind method,
+    # and takes a slice of the binary string up to that index and adds a '0' to the end of it
+        new_binary = binary[:binary.rfind('0')] + '0'
+        result = ""
+        for i in range(1, 33, 8):
+            print("continue", result)
+            result += str(int(new_binary[i:i+8], 2)) + "."
+    # the result string is returned with the last character (which is a period) removed using slice notation. This returns the IP address in dotted decimal notation with the netmask shifted down one bit.
+        return result[:-1]
+    
+  
+    #You would also need to change the network when you aggregate
+    #split the addresses by octets and do a bitwise operation 
+    def change_network(self, network, netmask):
+        new_network= ""
+        network = network.split(".")
+        netmask = netmask.split(".")
+        for i in range(0,4):
+            new_network += (str((int(network[i])) & (int(netmask[i])))) + "."
+            #-1 to ignore last .
+        return new_network[:-1]
+            
+
+
+
+    #when two or more adresses if there are two or more entries in the forwarding table that are adjacent numerically,
+    #forward to the same next-hop router, and have the same attributes then the two entries can be aggregated into a single entry.
+    def aggregate_routes(self):
+        for entry1 in self.routing_table:
+            for entry2 in self.routing_table:
+                if (entry1['localpref'] == entry2['localpref'] 
+                and entry1['ASPath'] == entry2['ASPath'] 
+                and entry1['origin'] == entry2['origin'] 
+                and entry1['selfOrigin'] == entry2['selfOrigin']
+                and self.is_adjacent(entry1['network'], entry2['network'], entry2['netmask'])
+                and entry1['netmask'] == entry2['netmask']):
+                    self.routing_table.remove(entry1) #remove first entry if rules are satisfied and change entry2 as an aggregated entry
+                    entry2['netmask'] = self.change_netmask(entry2['netmask'])
+                    entry2['network'] = self.change_network(entry2['network'], entry2['netmask'] )
+
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+
+                # Handle message based on message type
+                try:
+                    message = json.loads(msg)
+                    if message["type"] == "handshake":
+                        print("Received handshake message from %s" % srcif)
+                        # Send handshake response back
+                        self.send(srcif, json.dumps({"type": "handshake_response", "src": self.our_addr(
+                            self.neighbor), "dst": message["src"], "msg": {}}))
+
+                    
+                    #send your routing table when you receive a dump message
+                    elif message["type"] == "dump":
+                        for neighbor in self.sockets.keys():
+                            self.send(neighbor, json.dumps({"src": self.our_addr(
+                                neighbor), "dst": neighbor, "type": "table", "msg": self.routing_table}))
+
+
+
+                    #update the routing table with a new update message
+                    #aggregate every time that an update message is received
+                    elif message["type"] == "update":
+                        print(f"Received route update from {message['src']}: {message['msg']}")
+                        network = message["msg"]["network"]
+                        netmask = message["msg"]["netmask"]
+                        localpref = message["msg"]["localpref"]
+                        selfOrigin = message["msg"]["selfOrigin"]
+                        ASPath = message["msg"]["ASPath"]
+                        origin = message["msg"]["origin"]
+                        source = message["src"]
+                        item1 = {
+                            "origin": origin,
+                            "ASPath": ASPath,
+                            "selfOrigin": selfOrigin,
+                            "localpref": localpref,
+                            "netmask": netmask,
+                            "network": network,
+                            "peer": source
+                        }
+                        self.routing_table.append(item1)
+                        self.updated_networks.append(message)
+                        self.aggregate_routes()
+
+                        print(
+                            f"Added {network}/{netmask} to routing table with nexthop {message['src']}, localpref {localpref}, selfOrigin {selfOrigin}, ASPath {ASPath}, and origin {origin}")
+                        forwardMessage = {
+                            "network": network,
+                            "netmask": netmask,
+                            "ASPath": [self.asn] + ASPath
+                        }
+                        #if update message is received from customer then send to all neighbors
+                        if (self.relations[message["src"]] == "cust"):
+                            for neighbor in self.sockets.keys():
+                                if (message["src"] != neighbor) :
+                                    self.send(neighbor, json.dumps({"type": "update", "src": self.our_addr(neighbor), "dst": neighbor, "msg": forwardMessage}))
+                                    print(f"Sent update to {neighbor} with network {network}/{netmask} and ASPath {ASPath}")
+                        else: #if message received from peer or provider, then only senf to your customers
+                            for neighbor in self.sockets.keys():
+                                if (self.relations[neighbor] == "cust") :
+                                    self.send(neighbor, json.dumps({"type": "update", "src": self.our_addr(neighbor), "dst": neighbor, "msg": forwardMessage}))
+                                    print(f"Sent update to {neighbor} with network {network}/{netmask} and ASPath {ASPath}")
+
+                        
+
+                    #delivering a data message
+                    #first check for longest prefix, otherwise use tie breaking rules to pick the closest match ip address
+                    elif message["type"] == "data":
+                        destination = message['dst']
+                        best_route = None
+                        dests = destination.split('.')
+                        matching_networks = []
+                        
+                        
+                        for item in self.routing_table:
+                            netmasks = item["netmask"].split('.')
+                            networks = item["network"].split('.')
+                            netcount = 0
+                            
+                            # FINDING MATCHING IP ADDRESSES
+                            for i in range(0,4):
+                                if int(networks[i]) == (int(dests[i])) & (int(netmasks[i])):
+                                    netcount += 1 #match count received
+                            if netcount == 4:
+                                matching_networks.append(item)
+
+                        # NO MATCHING IPS
+                        if len(matching_networks) == 0:
+                            self.send(message['src'], 
+                                      json.dumps(
+                                          {"type": "no route",
+                                           "src": self.our_addr(srcif), 
+                                           "dst": message['src'], 
+                                           "msg": {}}))   
+                        if len(matching_networks) == 1:
+                           
+                            if self.relations[srcif] == "cust" or self.relations[matching_networks[0]['peer']] == "cust":
+                                self.send(matching_networks[0]['peer'], json.dumps({"type": "data", "src": message["src"], "dst": message["dst"], "msg": message['msg']}))
+
+                            else:
+                                self.send(message['src'], 
+                                        json.dumps(
+                                            {"type": "no route",
+                                            "src": self.our_addr(srcif), 
+                                            "dst": message['src'], 
+                                            "msg": {}}))   
+
+                        #Multiple matching networks have been found           
+                        elif len(matching_networks) > 1:
+                            
+                            longest_prefix = 0
+                            longest_pre = []
+                            
+                            for route in matching_networks : # finds the longest prefix number
+                                routebinary = self.tobinary(route["netmask"])
+                                if routebinary.count('1') > longest_prefix:
+                                    longest_prefix = routebinary.count('1')
+                            for route in matching_networks : # finds all the items with longest prefix number
+                                routebinary = self.tobinary(route["netmask"])
+                                if routebinary.count('1') == longest_prefix:
+                                    longest_pre.append(route)
+                           
+                            #a perfect match has been found     
+                            if len(longest_pre) == 1:
+                                if self.relations[srcif] == "cust" or self.relations[longest_pre[0]['peer']] == "cust":
+                                    self.send(longest_pre[0]['peer'], json.dumps({"type": "data", "src": message["src"], "dst": message["dst"], "msg": message['msg']}))
+                                else:
+                                    self.send(message['src'], 
+                                            json.dumps(
+                                                {"type": "no route",
+                                                "src": self.our_addr(srcif), 
+                                                "dst": message['src'], 
+                                                "msg": {}}))   
+                                    print("O MATCHING, SENT NO ROUTE")
+                            
+                            #more than one match has been found to have the longest prefix
+                            #go into tie-breaking rules
+                            if len(longest_pre) > 1:
+                                
+                                best_route = longest_pre[0]
+                                for prefix in longest_pre:
+                                    if prefix['localpref'] > best_route['localpref']:
+                                            best_route = prefix
+                                    elif prefix['localpref'] <= best_route['localpref']:
+                                        if prefix['selfOrigin'] and not best_route['selfOrigin']:
+                                            best_route = prefix
+                                        elif item['selfOrigin'] == best_route['selfOrigin']:
+                                            if len(prefix['ASPath']) < len(best_route['ASPath']):
+                                                best_route = prefix
+                                            elif len(prefix['ASPath']) == len(best_route['ASPath']):
+                                                if prefix['origin'] == "IGP" and best_route['origin'] == "EGP":
+                                                    best_route = prefix
+                                                elif prefix['origin'] == "EGP" and best_route['origin'] == "UNK":
+                                                    best_route = prefix
+                                                elif prefix['origin'] == "IGP" and best_route['origin'] == "UNK":
+                                                    best_route = prefix
+                                                elif prefix['origin'] == best_route['origin']:
+                                                   
+                                                    pref1 = self.tobinary(prefix['peer'])
+                                                    best_route1 = self.tobinary(best_route['peer'])
+                                                    if int(pref1, 2) < int(best_route1, 2):
+                                                        best_route = prefix
+                                if self.relations[srcif] == "cust" or self.relations[best_route['peer']] == "cust":
+                                    self.send(best_route['peer'], json.dumps({"type": "data", "src": message["src"], "dst": message["dst"], "msg": message['msg']}))
+                                    print(f"Sent update to {best_route['network']}")
+                                else:
+                                    self.send(message['src'], 
+                                            json.dumps(
+                                                {"type": "no route",
+                                                "src": self.our_addr(srcif), 
+                                                "dst": message['src'], 
+                                                "msg": {}}))   
+  
+
+                    #When a withdraw message is received, remove that entry from the routing table
+                    #Disaggregation is implemented by using aggregation. Don't update the routing table if the update message is in withdraw messages. 
+                    #If update message is not in withdraw, then append to routing table, and aggregate
+                    elif message["type"] == "withdraw":
+                        self.routing_table.clear()
+                        self.withdrawn_networks.append(message)
+                        print(f"Received withdraw revocation from {message['src']}: {message['msg']}")
+                     
+                            
+                        for u in self.updated_networks:
+                            isWithdrawn = False
+                            for w in self.withdrawn_networks:
+                                for s in w['msg']:
+                                    if u['src'] == w['src'] and u['msg']['network'] == s['network'] and u['msg']['netmask'] == s['netmask']:
+                                        isWithdrawn = True
+
+                            if not isWithdrawn:
+                                network = u["msg"]["network"]
+                                netmask = u["msg"]["netmask"]
+                                localpref = u["msg"]["localpref"]
+                                selfOrigin = u["msg"]["selfOrigin"]
+                                ASPath = u["msg"]["ASPath"]
+                                origin = u["msg"]["origin"]
+                                source = u["src"]
+                                item1 = {
+                                    "origin": origin,
+                                    "ASPath": ASPath,
+                                    "selfOrigin": selfOrigin,
+                                    "localpref": localpref,
+                                    "netmask": netmask,
+                                    "network": network,
+                                    "peer": source
+                                }
+                                self.routing_table.append(item1)
+                                self.aggregate_routes()
+
+                        print(f"Removed {network}/{netmask} from routing table with  {message['src']}")
+
+                        if (self.relations[message["src"]] == "cust"):
+                            for neighbor in self.sockets.keys():
+                                if (message["src"] != neighbor) :
+                                    self.send(neighbor, json.dumps({"type": "withdraw", "src": self.our_addr(neighbor), "dst": neighbor, "msg": message['msg']}))
+                                    print(f"Sent update to {neighbor} with network {network}/{netmask} and ASPath {ASPath}")
+                        else:
+                            for neighbor in self.sockets.keys():
+                                if (self.relations[neighbor] == "cust") and neighbor != message['src'] :
+                                    self.send(neighbor, json.dumps({"type": "withdraw", "src": self.our_addr(neighbor), "dst": neighbor, "msg": message['msg']}))
+                                    print(f"Sent update to {neighbor} with network {network}/{netmask} and ASPath {ASPath}")
+
+
+
+                except Exception as err :
+                    print("Received invalid message '%s' from %s" %
+                          (msg, srcif))
+                    print(err)
+                    print(traceback.format_exc())
+        return
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections',
+                        type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
