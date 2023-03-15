@@ -1,0 +1,86 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, zlib
+
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+        
+        self.recv_sequence_number = 0
+        self.remote_host = None
+        self.remote_port = None
+        self.packet_store = {}
+
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+
+                # Grab the remote host/port if we don't alreadt have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+   
+                #try to load with json
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                except:
+                    self.log("received corrupt packet")
+                    continue
+
+
+                # Calculate checksum
+                #remove the checksum so that it is not included in the calculation of the checksum
+                received_checksum = msg.pop("checksum")
+                computed_checksum = zlib.crc32(msg["message"].encode('utf-8'))
+
+                # Compare checksums
+                if received_checksum == computed_checksum:
+                    self.log("Received valid data message %s" % msg)
+
+                    # Send acknowledgment
+                    self.log("Sending ack message %s" % msg)
+                    self.send({ "type": "ack", "seq_num": msg["seq_num"] })
+
+                    #received sequence in message from sender is the same seq number in receive
+                    #in order
+                    if (msg["seq_num"] == self.recv_sequence_number):
+                        print(msg["message"], end='', flush=True)
+                        self.recv_sequence_number = msg["seq_num"] + 1  
+                    
+                    #when the packet is not in order, store it in the dictionary
+                    else :
+                        #dont store duplicate out of order packet
+                        if msg["seq_num"] not in self.packet_store:
+                            self.packet_store[msg["seq_num"]] = msg 
+                        
+                    #while loop which checks to see if next sequence number exists in dictionary keys
+                    while self.recv_sequence_number in self.packet_store:
+                        #remove entry from dictionary if required packet with sequence number is found and print the message in order
+                            msg = self.packet_store.pop(self.recv_sequence_number)
+                            print(msg["message"], end='', flush=True)
+                            self.recv_sequence_number = msg["seq_num"] + 1
+
+                else:
+                    self.log("Received corrupt packet: %s" % msg)                  
+        return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()
