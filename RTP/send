@@ -1,0 +1,110 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, zlib
+
+DATA_SIZE = 1375
+
+
+class Sender:
+    
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+        self.send_sequence_number = 0
+
+        # initialize the RTT and timeout duration to 1 second
+        self.rtt = 1.0
+        #allowed time for send and receiving ack
+        self.timeout_duration = 1.0
+
+
+        # initialize the buffer for storing unacknowledged packets (an unacknowledged packet means that there is a lost packet)
+        self.unacked_buffer = {}
+        #keep track of timeout of each packet
+        self.time_dict = {}
+     
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+        #initialize the timer to the current time
+        
+    def run(self):
+        window_size = 4
+        
+        
+        while True:
+            for packet in self.unacked_buffer.values():
+                #start time of packet
+                timeofpacket = self.time_dict[packet["seq_num"]]
+                if self.unacked_buffer and time.time() - timeofpacket >= self.rtt:
+                    #update time of packet again
+                    self.time_dict[packet["seq_num"]] = time.time()
+                    self.send(packet)
+                    self.log("Resending packet with sequence number: %d" % packet["seq_num"])
+
+
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+            socks = select.select(sockets, [], [], 0.1)[0]
+            last_ackmsg = None
+            for conn in socks:
+                if conn == self.socket: 
+                    k, addr = conn.recvfrom(65535)
+                    msg = k.decode('utf-8')
+                    self.log("Received message '%s'" % msg)
+
+                    try:
+                        last_ackmsg = json.loads(msg)["seq_num"]
+                        self.waiting = False
+                        window_size = window_size + 1
+
+                        if last_ackmsg in self.unacked_buffer:
+                            del self.unacked_buffer[last_ackmsg]
+                    except:
+                        self.log("data corrupted")
+                    
+                elif conn == sys.stdin:
+                    data = sys.stdin.read(DATA_SIZE) #reading 1375 bytes at the same time
+                    if len(data) == 0: #when you have read the whole thing
+                        if (len(self.unacked_buffer.keys()) == 0):
+                            self.log("All done!")
+                            # check if the awk message == the last sequence number
+                            sys.exit(0) #finished sending
+                        else:
+                            continue
+                    
+                    
+                    msg = { "type": "msg", "seq_num": self.send_sequence_number, "message": data}
+                    #calculate checksum
+                    checksum = zlib.crc32(data.encode('utf-8'))
+                    #insert checksum field into message content
+                    msg["checksum"] = checksum
+                    #get the time of each packet while sending
+                    self.time_dict[self.send_sequence_number] = time.time()
+                    self.send(msg)
+                    #append sequence number to the dictionary of packets with sequence numbers that have yet to receive an acknowledgment
+                    self.unacked_buffer[self.send_sequence_number] = msg
+                    self.send_sequence_number = self.send_sequence_number + 1
+                    #reduce window size by one after sending
+                    window_size = window_size - 1
+                    if window_size == 0:
+                        self.waiting = True #waiting for next ack
+                        
+                    
+        return
+    
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
