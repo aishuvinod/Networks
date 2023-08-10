@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+from enum import Enum
+
+
+#sends to everyone if you send to broadcast
+BROADCAST = "FFFF"
+
+#the state of the raft for leader election purposes
+class RaftState(Enum):
+    FOLLOWER = 1
+    CANDIDATE = 2
+    LEADER = 3
+
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        self.state = RaftState.FOLLOWER
+        self.current_term = 0
+        self.leader_id = BROADCAST
+        self.peer_id = None
+        self.votes_received = 0
+        self.timeout = random.uniform(.15,.3)
+        self.election_start = time.time()
+        #last heartbeat sent out by leader
+        self.last_heartbeat = time.monotonic()
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+    
+    #helper for starting the election process
+    #increase the current time, reset election time, vote for yourself, and send out a request to vote
+    def start_election(self):
+        self.election_start = time.time()
+        self.current_term += 1
+        self.votes_received += 1
+        request_vote = {
+                        "src": self.id,
+                        "dst": BROADCAST,
+                        "term" : self.current_term,
+                        "leader": self.leader_id,
+                        "type": "RequestVote",
+                    }
+        self.send(request_vote)
+
+    #leader should send out heartbeat
+    def send_heartbeat(self):
+        heartbeat = {
+                    "src": self.id,
+                    "dst": BROADCAST,
+                    "leader": self.leader_id,
+                    "type": "heartbeat"
+                    }
+        self.send(heartbeat)
+        self.last_heartbeat = time.monotonic()
+
+
+    def run(self):
+        store = {}
+        while True:
+            data, addr = self.socket.recvfrom(65535)
+            msg = json.loads(data.decode('utf-8'))
+
+      
+            # If the follower's election timeout elapses without receiving a valid heartbeat, it becomes a candidate and starts a new election:
+            if self.state == RaftState.FOLLOWER:
+                #in the case where you havent received a heartbeat, then start the election process after making yourself a candidate
+                if time.monotonic() - self.last_heartbeat > self.timeout:
+                    #election starting process
+                    self.state = RaftState.CANDIDATE
+                    self.start_election()
+                                      
+            # A candidate starts a new election by sending a request_vote message to all other replicas. If a candidate receives votes from a majority of replicas, it becomes the leader.
+            # If a candidate receives a valid heartbeat or a higher term from another replica, it becomes a follower
+            elif self.state == RaftState.CANDIDATE:
+                # Check if we have already received enough votes to become the leader
+                if self.votes_received > len(self.others) / 2:
+                    self.state = RaftState.LEADER
+                    self.leader_id = self.id
+                    self.send_heartbeat()
+                #start new election if election timeout elapses
+                elif time.time() - self.election_start > self.timeout:
+                    self.start_election()
+                
+
+            #if leader, then send heartbeat
+            elif self.state == RaftState.LEADER:
+                #if time.monotonic() - self.last_heartbeat > .2:
+                    # Send heartbeats to all peers
+                self.send_heartbeat()
+
+            #deal with messages
+            if msg["type"] == "heartbeat" and msg["leader"] != BROADCAST and self.id != self.leader_id:
+                    self.last_heartbeat = time.monotonic()
+            if msg["type"] == "RequestVote":
+                if self.current_term > msg["term"]:
+                    voteresponse = {
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "voteGranted" : False,
+                        "leader": self.leader_id,
+                        "type": "VoteResponse",
+                    }
+                    self.send(voteresponse)
+                else:
+                    voteresponse = {
+                        "src": self.id,
+                        "dst":  msg["src"],
+                        "voteGranted" : True,
+                        "leader": self.leader_id,
+                        "type": "VoteResponse",
+                    }
+                    self.send(voteresponse)
+                    self.leader_id = msg["src"]
+                    self.state = RaftState.FOLLOWER
+                    self.current_term = msg["term"]
+            if msg["type"] == "VoteResponse":
+                if msg["voteGranted"] == True:
+                    self.votes_received += 1
+                    if self.votes_received > len(self.others) / 2:
+                        self.state = RaftState.LEADER
+                        self.leader_id = self.id
+                        self.send_heartbeat()
+
+            # Handle get() requests
+            if msg["type"] == "get":
+                # extract the key
+                key = msg["key"]
+                value = ""
+                # for the case where the key is empty
+                if self.id != self.leader_id:
+                    redirect = {
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "leader": self.leader_id,
+                        "type": "redirect",
+                        "MID": msg["MID"],
+                    }
+                    self.send(redirect)
+                if key in store and self.id == self.leader_id:
+                    value = store[key]
+                    okresponse = {
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "leader": self.leader_id,
+                        "type": "ok",
+                        "MID": msg["MID"],
+                        "value": value
+                    }
+                    self.send(okresponse)                  
+                else:
+                    failresponse = {
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "leader": self.leader_id,
+                        "type": "fail",
+                        "MID": msg["MID"]
+                    }
+                    self.send(failresponse)
+
+
+            # Handle put() requests
+            if msg["type"] == "put":
+                # extract the key and value from the message
+                key = msg["key"]
+                value = msg["value"]
+                # store the key-value pair in the store               
+                if self.id != self.leader_id and msg["leader"] != BROADCAST:
+                    # send a redirect message to the client
+                    redirect = {
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "leader": self.leader_id,
+                        "type": "redirect",
+                        "MID": msg["MID"]
+                    }
+                    self.send(redirect)
+                if self.id == self.leader_id:
+                    try:
+                        store[key] = value
+                        # send a success response to the client
+                        okresponse = {
+                            "src": self.id,
+                            "dst": msg["src"],
+                            "leader": self.leader_id,
+                            "type": "ok",
+                            "MID": msg["MID"]
+                        }
+                        self.send(okresponse)
+                        for i in self.others:
+                            heartbeat = {
+                            "src": self.id,
+                            "dst": i,
+                            "leader": self.leader_id,
+                            "type": "heartbeat"
+                        }
+                            self.send(heartbeat)
+                            self.last_heartbeat = time.time()
+                    except:
+                        failresponse = {
+                            "src": self.id,
+                            "dst": msg["src"],
+                            "leader": self.leader_id,
+                            "type": "fail",
+                            "MID": msg["MID"]
+                        }
+                        self.send(failresponse)
+
+
+            else:
+                print("Received message '%s'" % (msg,), flush=True)
+
+
+            
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
