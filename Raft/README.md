@@ -1,12 +1,15 @@
-HIGH LEVEL APPROACH
 The Raft protocol is a consensus algorithm for distributed systems, ensuring nodes agree on data even during failures. It uses a leader-follower model, where one leads the process, coordinating log replication. Raft simplifies complex tasks like leader election and maintains data consistency, making it a reliable choice for distributed system reliability.
 Compared to some other consensus algorithms, Raft aims to be more understandable and straightforward, which facilitates its implementation and troubleshooting. Its clear separation of roles and well-defined rules for leader election and log replication make it an attractive choice for building reliable and fault-tolerant distributed systems.
+
+Here is the resource that I followed to design the protocol: https://raft.github.io/raft.pdf
+
+Approach:
 Leader election -
-- I created an enum so that I could establish the three states of the Raft as follower, candidate or leader. I made three if statements that implement the details for each state.
+- I created an enum so that I could establish the three states of the Raft as a follower, candidate, or leader. I made three if statements that implement the details for each state.
 
 - LEADER: Send heartbeats consistently
-- FOLLOWER: Keep checking for heartbeats and if you dont get heartbeats from the leader, elect yourself as the candidate. Increase the current term, vote for yourself, and broadcast a request to get votes.
-- CANDIDATE : If you have the majority votes, make yourself the leader. If you dont or if the election has timed out, then, restart the election.
+- FOLLOWER: Keep checking for heartbeats and if you don't get heartbeats from the leader, elect yourself as the candidate. Increase the current term, vote for yourself, and broadcast a request to get votes.
+- CANDIDATE: If you have the majority votes, make yourself the leader. If you don't or if the election has timed out, then, restart the election.
 **I made helpers to start an election and send heartbeats
 
 - Handled messages like "RequestVote" and "VoteResponse" within if statements. If you get a requestvote message, then either grant a vote or not by checking to see the term. If you get a VoteResponse, then check your votecount, increase it, and decide whether youre the leader or not.
